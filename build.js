@@ -171,6 +171,19 @@ function get_file(path) {
 
             let do_vars_on = [block]
 
+            const patchTarget =
+                block.pattern?.target ??
+                block.regex?.target ??
+                block.copy?.target;
+
+            if (
+                typeof patchTarget === "string" &&
+                patchTarget.startsWith("=[SMODS")
+            ) {
+                console.warn("Skipping unsupported SMODS patch:", patchTarget);
+                continue;
+            }
+
             // TODO: Do vars
 
             // while (do_vars_on.length > 0) {
