@@ -1,25 +1,18 @@
+// Requires (load BEFORE this file in index.html): toml.js, lua-compat.js, lovely-patcher.js
+
 function escapeRegExp(string) {
     return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // $& means the whole matched string
 }
 
-function string_searchAll(string, regex) {
-    regex = regex.toString().replace(/\/(.*)\/g/, "$1")
-    const positions = []
-
-    let nextRegex = regex
-    while (true) {
-        result = string.search(new RegExp(nextRegex))
-        if (result == -1) {
-            break
-        }
-        nextRegex = ".{" + result + ",}?" + regex
-        positions.push(result)
-    }
-    return positions
-}
+/**
+ * Lovely applies lower `priority` values first (VERIFY against lovely docs;
+ * Steamodded ships a negative priority so that it runs before other mods).
+ * The original code sorted descending. Flip this constant if verification
+ * shows otherwise.
+ */
+const LOVELY_PRIORITY_ASCENDING = true;
 
 /**
- * 
  * @param {Blob | File} blob .zip or .exe of balatro
  * @param {Object<string, Object>} mods Nested object of mods
  * @returns {Promise<Blob>} .zip of patched source
@@ -35,8 +28,6 @@ async function buildFromSource(blob, mods) {
     const reader = new BufferReader(buffer)
 
     // Search for "PK\x03\x04"
-    // Not many ways to do this better.
-    // Works for .zip archives bc they start with PK\3\4
     while (true) {
         if (reader.string(4) === "PK\x03\x04") break
         reader.step(-3)
@@ -46,55 +37,37 @@ async function buildFromSource(blob, mods) {
     reader.step(-4)
     const pkfile = reader.bytes(reader.view.byteLength - reader.offset)
 
-    /**
-     * 
-     * @param {string} path A file path
-     * @returns {Promise<string>} Contents of file
-     */
-   
-function get_file(path) {
-    const file = zipfile.file(path);
-
-    if (!file) {
-        throw new Error(
-            `Missing game file: "${path}". Check the game archive and mod patches.`
-        );
+    function get_file(path) {
+        const file = zipfile.file(path);
+        if (!file) {
+            throw new Error(`Missing game file: "${path}". Check the game archive and mod patches.`);
+        }
+        return file.async("string");
     }
 
-    return file.async("string");
-}
-
-    /**
-     * 
-     * @param {string} path A file path
-     * @returns {Promise<string>} Contents of file
-     */
     function get_mod_file(mod, path) {
         let current = mods[mod]
-        const chunks = path.split("/")
-        for (const chunk of chunks) {
-            current = current[chunk]
+        for (const chunk of path.split("/")) {
+            if (chunk === "" || chunk === ".") continue
+            current = current ? current[chunk] : undefined
         }
-        /** @type {File} */
-        const file = current;
-        return file.text()
+        if (!(current instanceof File)) {
+            throw new Error(`Mod "${mod}" has no file "${path}"`)
+        }
+        return current.text()
     }
 
-    /**
-     * 
-     * @param {string} path Path to file
-     * @param {string} data Contents of file
-     */
-   function set_file(path, data) {
-    zipfile.file(path, data);
-}
+    function set_file(path, data) {
+        zipfile.file(path, data);
+    }
 
     progress_bar.value = "40"
     status_text.innerText = "Extracting zip"
     const zipfile = await JSZip.loadAsync(new Blob([pkfile]))
 
-    // THE TYPE!
-    /** @type {Array<{name: string, src: {manifest: {version: string, dump_lua: boolean, priority: number}, patches: {pattern: {target: string, pattern: string, position: 'before'|'at'|'after', payload: string, match_indent: boolean}, regex: {target: string, pattern: string, position: string, line_prepend: string, payload: string}, module: {source: string, before: string, name: string}, copy: {target: string, position: string, sources: string[]}}[]}, vars: [Object<String, String>] }>} */
+    /** Everything that did not apply cleanly. Shown in the console and on window.lastBuildReport. */
+    const report = { applied: 0, unmatched: [], skipped: [], errors: [], luaWarnings: [], gotoRewrites: 0 }
+
     const patch_list = [];
 
     // Replace source with patched data from external tool.
@@ -112,27 +85,70 @@ function get_file(path) {
         parseLovelyDump(mods["Dump from Lovely"], "")
     }
 
+    // ------------------------------------------------------------------
+    // Copy every mod into Mods/ FIRST. (It used to happen at the very end,
+    // which made it impossible to patch Steamodded's own files, so every
+    // `=[SMODS ...]` patch had to be skipped.)
+    // ------------------------------------------------------------------
+    function add_dir(dir, path) {
+        for (const [name, entry] of Object.entries(dir)) {
+            if (entry instanceof File) zipfile.file(path + name, entry)
+            else add_dir(entry, path + name + "/")
+        }
+    }
+    const mods_without_dump = {}
+    for (const [mod_name, mod_data] of Object.entries(mods)) {
+        if (mod_name != "Dump from Lovely") mods_without_dump[mod_name] = mod_data
+    }
+    add_dir(mods_without_dump, "Mods/")
+
+    // Map Steamodded mod ids -> folder, so "=[SMODS <id> "<path>"]" targets can
+    // be resolved to real files under Mods/<folder>/<path>.
+    const modIndex = {}
+    for (const [folder, tree] of Object.entries(mods_without_dump)) {
+        for (const [fname, f] of Object.entries(tree)) {
+            if (!(f instanceof File)) continue
+            try {
+                if (fname.endsWith(".json")) {
+                    const j = JSON.parse(await f.text())
+                    if (j && typeof j.id === "string") modIndex[j.id] = folder
+                } else if (fname.endsWith(".lua")) {
+                    const m = /^\s*---\s*MOD_ID\s*:\s*(\S+)/m.exec((await f.text()).slice(0, 2000))
+                    if (m) modIndex[m[1]] = folder
+                }
+            } catch (_) { /* not a manifest */ }
+        }
+    }
+    // "_" is Steamodded's own pseudo-id (VERIFY). Find its folder by name, then by layout.
+    if (!modIndex["_"]) {
+        const byName = Object.keys(mods_without_dump).find((n) => /smods|steamodded/i.test(n))
+        const byLayout = Object.keys(mods_without_dump).find((n) => mods_without_dump[n].src && mods_without_dump[n].lovely)
+        if (byName || byLayout) modIndex["_"] = byName || byLayout
+    }
+
+    function resolveTarget(target) {
+        if (typeof target !== "string") return { error: "no target" }
+        const m = /^=\[SMODS (\S+) "(.+)"\]$/.exec(target)
+        if (m) {
+            const folder = modIndex[m[1]]
+            if (!folder) return { error: `no loaded mod with id "${m[1]}"` }
+            return { path: "Mods/" + folder + "/" + m[2] }
+        }
+        if (target.startsWith("=[")) return { error: "unsupported virtual target" }
+        return { path: target }
+    }
+
     // Mods go here
     for (const [name, mod] of Object.entries(mods)) {
-        if (name == "Dump from Lovely") {
-            continue // Skip LovelyDump, it is handled separately
-        }
+        if (name == "Dump from Lovely") continue
 
         const tomls = []
         if (mod["lovely.toml"]) {
-            tomls.push({
-                toml: mod["lovely.toml"],
-                path: "lovely.toml"
-            })
+            tomls.push({ toml: mod["lovely.toml"], path: "lovely.toml" })
         }
         if (mod["lovely"]) {
-            for (const [name, patch] of Object.entries(mod["lovely"])) {
-                if (name.endsWith(".toml")) {
-                    tomls.push({
-                        toml: patch,
-                        path: "lovely/" + name
-                    })
-                }
+            for (const [fname, patch] of Object.entries(mod["lovely"])) {
+                if (fname.endsWith(".toml")) tomls.push({ toml: patch, path: "lovely/" + fname })
             }
         }
         for (const file of tomls) {
@@ -140,216 +156,95 @@ function get_file(path) {
                 patch_list.push({
                     src: toml.parse(await file.toml.text()),
                     name: name,
+                    file: file.path,
                     dont_patch: mod["dont_patch.txt"] ? true : false,
                 })
             } catch (err) {
+                report.errors.push(`${name}/${file.path}: TOML parse failure: ${err.message}`)
                 console.error("Failure while parsing mod " + name + " file " + file.path)
                 console.error(err)
             }
         }
     }
 
-    patch_list.sort((a, b) => {
-        return a.src.manifest.priority > b.src.manifest.priority ? -1 : a.src.manifest.priority == b.src.manifest.priority ? 0 : 1
-    })
+    const prio = (p) => (p.src.manifest && typeof p.src.manifest.priority === "number") ? p.src.manifest.priority : 0
+    patch_list.sort((a, b) => LOVELY_PRIORITY_ASCENDING ? prio(a) - prio(b) : prio(b) - prio(a))
 
     let modules_to_load = {}
 
     for (const patch_data of patch_list) {
         status_text.innerText = "Applying mod " + patch_data.name
-        const vars = patch_data.vars || {}
+        const vars = patch_data.src.vars || {}
+        const ex = (s) => LovelyPatcher.expandVars(s, vars, (w) => report.errors.push(`${patch_data.name}: ${w}`))
 
-        function do_vars(string) {
-            for (const [key, value] of Object.entries(vars)) {
-                string = string.replaceAll(`{{lovely:${key}}}`, value)
-            }
-            return string
-        }
+        for (const block of patch_data.src.patches || []) {
+            const kind = block.pattern ? "pattern" : block.regex ? "regex" : block.copy ? "copy" : block.module ? "module" : null
+            if (!kind) continue
+            const patch = block[kind]
+            const label = `${patch_data.name}/${patch_data.file} -> ${patch.target || patch.name || "?"} [${kind}]`
 
-
-        for (const block of patch_data.src.patches) {
-
-            let do_vars_on = [block]
-
-            const patchTarget =
-                block.pattern?.target ??
-                block.regex?.target ??
-                block.copy?.target;
-
-            if (
-                typeof patchTarget === "string" &&
-                patchTarget.startsWith("=[SMODS")
-            ) {
-                console.warn("Skipping unsupported SMODS patch:", patchTarget);
-                continue;
-            }
-
-
-            // TODO: Do vars
-
-            // while (do_vars_on.length > 0) {
-            //     const current = do_vars_on.pop()
-            //     for (const [key, value] of Object.entries(current)) {
-            //         if (typeof value == "string") {
-            //             current[key] = do_vars(value)
-            //         } else if (typeof value == "object" && value !== null) {
-            //             do_vars_on.push(value)
-            //         }
-            //     }
-            // }
-
-
-
-            if (block.pattern && !patch_data.dont_patch) {
-
-                if (
-                    block.pattern?.target?.startsWith("=[SMODS") ||
-                    block.regex?.target?.startsWith("=[SMODS")
-                ) {
-                    continue;
+            try {
+                if (kind === "module") {
+                    // Even though the patch specifies 'load module BEFORE other file'
+                    // We load it after to prevent missing objects.
+                    const file_name = patch.name.replace(/\./g, "/") + ".lua"
+                    set_file(file_name, await get_mod_file(patch_data.name, patch.source))
+                    if (!patch_data.dont_patch) {
+                        modules_to_load[patch.before] = modules_to_load[patch.before] || []
+                        modules_to_load[patch.before].push(patch.name)
+                    }
+                    continue
                 }
-                const patch = block.pattern
-                patch.limit = patch.limit || Infinity
 
-                let contents = await get_file(patch.target)
-                if (patch.position == "at") {
-                    contents = contents.replace(patch.pattern, patch.payload)
-                } else if (patch.position == "before") {
-                    contents = contents.replace(patch.pattern, patch.payload + " " + patch.pattern)
+                if (patch_data.dont_patch) continue
+
+                const res = resolveTarget(patch.target)
+                if (res.error) { report.skipped.push(`${label}: ${res.error}`); continue }
+                const file = zipfile.file(res.path)
+                if (!file) { report.skipped.push(`${label}: missing target file ${res.path}`); continue }
+
+                const contents = await file.async("string")
+                let result
+                if (kind === "pattern") {
+                    result = LovelyPatcher.applyPattern(contents, Object.assign({}, patch, { pattern: ex(patch.pattern), payload: ex(patch.payload) }))
+                } else if (kind === "regex") {
+                    result = LovelyPatcher.applyRegex(contents, Object.assign({}, patch, { pattern: ex(patch.pattern), payload: ex(patch.payload) }))
                 } else {
-                    contents = contents.replace(patch.pattern, patch.pattern + " " + patch.payload)
+                    const texts = []
+                    for (const f of patch.sources) {
+                        texts.push("-- " + patch_data.name + " - " + f + "\n" + await get_mod_file(patch_data.name, f))
+                    }
+                    result = { contents: LovelyPatcher.applyCopy(contents, texts, patch.position), count: texts.length }
                 }
 
-                set_file(patch.target, contents)
-            }
-            if (block.regex && !patch_data.dont_patch) {
-                const patch = block.regex
-                patch.limit = patch.limit || Infinity
-                patch.line_prepend = patch.line_prepend || ""
-                patch.payload = patch.line_prepend + patch.payload.replace("\n", "\n" + patch.line_prepend)
-
-                const pattern = new RegExp(patch.pattern, "g")
-
-                let contents = await get_file(patch.target)
-
-                let locs = []
-            
-                let data;
-                while ((data = pattern.exec(contents)) !== null) {
-                    locs.push({
-                        index: data.index,
-                        index_groups: data.slice(1),
-                        groups: data.groups ?? {},
-                        match: data[0]
-                    })
-                }
-                
-                let delta = 0;
-                
-                let i = 0
-                for (const match of locs) {
-
-                    if (i > patch.limit) {
-                        break
-                    }
-                    i++
-
-                    let replacer = patch.payload;
-                    let original_size = match.match.length;
-                    for (let i = 0; i < match.index_groups.length; i++) {
-                        replacer = replacer.replaceAll("$" + (i + 1), match.index_groups[i])
-                    }
-                    for (const [key, value] of Object.entries(match.groups)) {
-                        replacer = replacer.replaceAll("$" + key, value)
-                    }
-
-                    if (patch.position == "at") {
-                        contents = contents.slice(0, match.index + delta) + replacer + contents.slice(match.index + delta + original_size)
-                        delta += replacer.length - original_size
-                    } else if (patch.position == "before") {
-                        contents = contents.slice(0, match.index + delta) + replacer + contents.slice(match.index + delta)
-                        delta += replacer.length
-                    } else {
-                        contents = contents.slice(0, match.index + delta + original_size) + replacer + contents.slice(match.index + delta + original_size)
-                        delta += replacer.length
-                    }
-                }
-
-                set_file(patch.target, contents)
-            }
-            if (block.copy && !patch_data.dont_patch) {
-                const patch = block.copy
-                let contents = await get_file(patch.target)
-                if (patch.position == "before") {
-                    for (const file of patch.sources) {
-                        const source_contents = await get_mod_file(patch_data.name, file)
-
-                        contents = "-- " + patch_data.name + " - " + file + "\n" + source_contents + "\n" + contents
-                    }
+                if (result.count === 0) {
+                    report.unmatched.push(`${label}: pattern matched nothing: ${String(patch.pattern || "").trim().slice(0, 80)}`)
                 } else {
-                    for (const file of patch.sources) {
-                        const source_contents = await get_mod_file(patch_data.name, file)
-
-                        contents += "\n-- " + patch_data.name + " - " + file + "\n" + source_contents
-                    }
+                    report.applied++
+                    set_file(res.path, result.contents)
                 }
-                set_file(patch.target, contents)
-            }
-            if (block.module) {
-                // Even though the patch specifies 'load module BEFORE other file'
-                // We load it after to prevent missing objects.
-
-                const patch = block.module
-
-                const file_name = patch.name.replace(".", "/") + ".lua"
-
-                // Create module file to load from
-                set_file(file_name, await get_mod_file(patch_data.name, patch.source))
-
-                if (!patch_data.dont_patch) {
-                    // Add import statement for module to load it.
-                    modules_to_load[patch.before] = modules_to_load[patch.before] || []
-                    modules_to_load[patch.before].push(patch.name)
-                }
+            } catch (err) {
+                report.errors.push(`${label}: ${err.message}`)
+                console.error(label, err)
             }
         }
     }
 
     for (const [path, module] of Object.entries(modules_to_load)) {
-        let contents = await get_file(path)
+        const f = zipfile.file(path)
+        if (!f) { report.skipped.push(`module load target missing: ${path}`); continue }
+        let contents = await f.async("string")
         for (const to_require of module) {
             contents += `\nrequire '${to_require}'`
         }
         set_file(path, contents)
     }
 
-    // Move every mod into the 'Mods' folder
-    function move_dir(dir, path) {
-        for (const [name, file] of Object.entries(dir)) {
-            if (!(file instanceof File)) {
-                zipfile.folder(path + name)
-                move_dir(file, path + name + "/")
-            } else {
-                zipfile.file(path + name, file)
-            }
-        }
-    }
-
-    mods_without_dump = {}
-
-    for (const [mod_name, mod_data] of Object.entries(mods)) {
-        if (mod_name != "Dump from Lovely") {
-            mods_without_dump[mod_name] = mod_data
-        }
-    }
-
-    console.log(mods_without_dump)
-
-    move_dir(mods_without_dump, "Mods/")
-
     progress_bar.value = "50"
     status_text.innerText = "Applying Patches"
-    
+
+    // These deliberately overwrite same-named files from mods (e.g. Steamodded's
+    // ffi-based nativefs.lua and its lovely module), so they must come after patching.
     for (const patch_file of Object.keys(window.patches)) {
         zipfile.file(patch_file, window.patches[patch_file])
     }
@@ -381,8 +276,40 @@ function get_file(path) {
             zipfile.folder("resources").folder("shaders").file("hologram.fs", contents.replace(/glow_samples;/g, "4;"))
         }
 
-
         zipfile.file("web_patched", "true")
+    }
+
+    // ------------------------------------------------------------------
+    // Lua 5.1 compatibility pass over EVERY .lua in the archive (game files,
+    // Lovely dump, Steamodded, mods). love.js is not LuaJIT, so `goto` must go.
+    // ------------------------------------------------------------------
+    progress_bar.value = "85"
+    status_text.innerText = "Making Lua 5.1 compatible"
+    const luaPaths = []
+    zipfile.forEach((relPath, f) => { if (!f.dir && relPath.endsWith(".lua")) luaPaths.push(relPath) })
+    const luaErrors = []
+    for (const p of luaPaths) {
+        const text = await zipfile.file(p).async("string")
+        try {
+            const out = LuaCompat.transformGoto(text, p)
+            if (out !== text) { zipfile.file(p, out); report.gotoRewrites++ }
+        } catch (e) {
+            luaErrors.push(e.message)
+        }
+        for (const w of LuaCompat.scanIncompatibilities(text)) report.luaWarnings.push(p + ": " + w)
+    }
+
+    window.lastBuildReport = report
+    console.log("Build report", report)
+    if (report.unmatched.length) console.warn("Patches that matched nothing:\n" + report.unmatched.join("\n"))
+    if (report.skipped.length) console.warn("Patches skipped:\n" + report.skipped.join("\n"))
+    if (report.errors.length) console.error("Patch errors:\n" + report.errors.join("\n"))
+    if (report.luaWarnings.length) console.warn("Possible LuaJIT-only code:\n" + report.luaWarnings.join("\n"))
+
+    if (luaErrors.length) {
+        status_text.innerText = "Build failed: unsupported goto/label (see console)"
+        console.error("Unsupported goto/label usage:\n" + luaErrors.join("\n"))
+        throw new Error("Unsupported goto/label usage in " + luaErrors.length + " place(s):\n" + luaErrors.join("\n"))
     }
 
     progress_bar.value = "90"
@@ -390,7 +317,10 @@ function get_file(path) {
     status_text.innerText = "Zipping zip"
     const game = await zipfile.generateAsync({ type: "blob" })
     progress_bar.value = "100"
-    status_text.innerText = "Done"
+    const warnCount = report.unmatched.length + report.skipped.length + report.errors.length
+    status_text.innerText = warnCount
+        ? `Done with ${warnCount} patch warning(s) - open the console / window.lastBuildReport`
+        : "Done"
 
     return game
 }
