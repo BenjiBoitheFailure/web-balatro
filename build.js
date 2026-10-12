@@ -201,6 +201,13 @@ function get_file(path) {
 
 
             if (block.pattern && !patch_data.dont_patch) {
+
+                if (
+                    block.pattern?.target?.startsWith("=[SMODS") ||
+                    block.regex?.target?.startsWith("=[SMODS")
+                ) {
+                    continue;
+                }
                 const patch = block.pattern
                 patch.limit = patch.limit || Infinity
 
