@@ -51,13 +51,18 @@ async function buildFromSource(blob, mods) {
      * @param {string} path A file path
      * @returns {Promise<string>} Contents of file
      */
-    function get_file(path) {
-        let current = zipfile
-        for (const chunk of path.split("/").slice(0, -1)) {
-            current = zipfile.folder(chunk)
-        }
-        return current.file(path.split("/").at(-1)).async("string")
+   
+function get_file(path) {
+    const file = zipfile.file(path);
+
+    if (!file) {
+        throw new Error(
+            `Missing game file: "${path}". Check the game archive and mod patches.`
+        );
     }
+
+    return file.async("string");
+}
 
     /**
      * 
@@ -80,13 +85,9 @@ async function buildFromSource(blob, mods) {
      * @param {string} path Path to file
      * @param {string} data Contents of file
      */
-    function set_file(path, data) {
-        let current = zipfile
-        for (const chunk of path.split("/").slice(0, -1)) {
-            current = current.folder(chunk)
-        }
-        current.file(path.split("/").at(-1), data)
-    }
+   function set_file(path, data) {
+    zipfile.file(path, data);
+}
 
     progress_bar.value = "40"
     status_text.innerText = "Extracting zip"
