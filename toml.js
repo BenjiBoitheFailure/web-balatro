@@ -1841,7 +1841,7 @@ function peg$subclass(child, parent) {
           s0 = peg$currPos;
           s1 = peg$currPos;
           peg$silentFails++;
-          if (input.substr(peg$currPos, 3) === peg$c23) {
+          if (input.substr(peg$currPos, 3) === peg$c23 && input.charAt(peg$currPos + 3) !== """) {
             s2 = peg$c23;
             peg$currPos += 3;
           } else {
@@ -1947,7 +1947,7 @@ function peg$subclass(child, parent) {
       s0 = peg$currPos;
       s1 = peg$currPos;
       peg$silentFails++;
-      if (input.substr(peg$currPos, 3) === peg$c29) {
+      if (input.substr(peg$currPos, 3) === peg$c29 && input.charAt(peg$currPos + 3) !== "'") {
         s2 = peg$c29;
         peg$currPos += 3;
       } else {
