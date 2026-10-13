@@ -13,6 +13,51 @@ function escapeRegExp(string) {
 const LOVELY_PRIORITY_ASCENDING = true;
 
 /**
+ * Runtime diagnostic appended to main.lua (set to false to disable). About 5 seconds after boot it prints
+ * "[web-debug-lua]" lines to the browser console: what Steamodded thinks its paths are, what the file system
+ * shim returns for the mods folder, which mods Steamodded registered, and how many Pokermon jokers exist.
+ */
+const WEB_DEBUG_LUA = true;
+const WEB_DEBUG_LUA_SOURCE = [
+    "-- [web-debug-lua] appended by build.js",
+    "do",
+    "    local _update, frames = love.update, 0",
+    "    if _update then",
+    "        love.update = function(...)",
+    "            frames = frames + 1",
+    "            if frames == 300 then",
+    "                local ok, err = pcall(function()",
+    "                    local function p(...) print('[web-debug-lua]', ...) end",
+    "                    p('SMODS', type(SMODS), SMODS and SMODS.version, SMODS and SMODS.MODS_DIR, SMODS and SMODS.path)",
+    "                    p('NFS', type(NFS), SMODS and type(SMODS.NFS))",
+    "                    if NFS and NFS.getWorkingDirectory then p('cwd', NFS.getWorkingDirectory()) end",
+    "                    local dir = (SMODS and SMODS.MODS_DIR) or 'Mods'",
+    "                    local items = {}",
+    "                    if NFS and NFS.getDirectoryItems then for _, v in ipairs(NFS.getDirectoryItems(dir) or {}) do items[#items+1] = v end end",
+    "                    p('NFS items in ' .. tostring(dir), table.concat(items, ', '))",
+    "                    local fs = {}",
+    "                    for _, v in ipairs(love.filesystem.getDirectoryItems('Mods')) do fs[#fs+1] = v end",
+    "                    p('love.filesystem Mods', table.concat(fs, ', '))",
+    "                    local ml = (SMODS and SMODS.mod_list) or {}",
+    "                    local ids = {}",
+    "                    for _, m in ipairs(ml) do ids[#ids+1] = tostring(m.id) end",
+    "                    p('mod_list', #ml, table.concat(ids, ', '))",
+    "                    local mods = {}",
+    "                    for k in pairs((SMODS and SMODS.Mods) or {}) do mods[#mods+1] = tostring(k) end",
+    "                    p('SMODS.Mods', table.concat(mods, ', '))",
+    "                    local n = 0",
+    "                    for k in pairs((G and G.P_CENTERS) or {}) do if tostring(k):find('^j_poke') then n = n + 1 end end",
+    "                    p('pokermon jokers in G.P_CENTERS', n)",
+    "                end)",
+    "                if not ok then print('[web-debug-lua] error', err) end",
+    "            end",
+    "            return _update(...)",
+    "        end",
+    "    end",
+    "end",
+].join("\n");
+
+/**
  * @param {Blob | File} blob .zip or .exe of balatro
  * @param {Object<string, Object>} mods Nested object of mods
  * @returns {Promise<Blob>} .zip of patched source
@@ -387,6 +432,10 @@ async function buildFromSource(blob, mods) {
                 report.smodsPathOverride = "Mods/" + folder + "/"
             } else {
                 report.smodsPathOverride = folder ? "NOT APPLIED: no single-line 'SMODS.path = find_self(...)' found in main.lua" : "NOT APPLIED: Steamodded folder not identified"
+            }
+            if (WEB_DEBUG_LUA && !text.includes("[web-debug-lua]")) {
+                text += "\n" + WEB_DEBUG_LUA_SOURCE + "\n"
+                zipfile.file("main.lua", text)
             }
         }
     }
